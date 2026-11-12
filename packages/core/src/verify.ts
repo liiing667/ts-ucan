@@ -1,6 +1,6 @@
 import * as token from "./token.js"
 import Plugins from "./plugins.js"
-import { capabilityCanBeDelegated, DelegationSemantics, DelegationChain, delegationChains, equalCanDelegate, rootIssuer } from "./attenuation.js"
+import { capabilityCanBeDelegated, DelegationSemantics, DelegationChain, delegationChains, equalCanDelegate, isProofBudgetExceededError, ProofBudgetExceededError, ProofGraphBudget, rootIssuer } from "./attenuation.js"
 import { Capability, isCapability } from "./capability/index.js"
 import { Fact, Ucan } from "./types.js"
 
@@ -42,6 +42,14 @@ export interface VerifyOptions {
    * By default this will ignore all facts in the UCAN and just return true.
    */
   checkFacts?: (facts: Fact[]) => boolean
+  /**
+   * an optional bounded budget for proof graph traversal while verifying.
+   * Shared proofs (eg. referenced via `prf:*`) can otherwise be recursively
+   * expanded repeatedly, making signature checks and chain enumeration grow
+   * exponentially. Defaults to {@link DEFAULT_PROOF_GRAPH_BUDGET}. If the
+   * budget is exhausted verification fails with a {@link ProofBudgetExceededError}.
+   */
+  proofGraphBudget?: Partial<ProofGraphBudget>
 }
 
 
@@ -85,6 +93,13 @@ export const verify = (plugins: Plugins) =>
   if (typeof checkFacts !== "function") {
     throw new TypeError(`Expected a function as 6th argument, but got ${checkFacts}`)
   }
+  const proofGraphBudget = options.proofGraphBudget ?? {}
+  const maxDepth = proofGraphBudget.maxDepth
+  const maxEvaluations = proofGraphBudget.maxEvaluations
+  if ((maxDepth != null && (!Number.isInteger(maxDepth) || maxDepth < 0))
+    || (maxEvaluations != null && (!Number.isInteger(maxEvaluations) || maxEvaluations < 1))) {
+    throw new TypeError(`Expected a proof graph budget with non-negative integer maxDepth and positive integer maxEvaluations, but got ${JSON.stringify(proofGraphBudget)}`)
+  }
 
   try {
     // Verify the UCAN
@@ -98,10 +113,17 @@ export const verify = (plugins: Plugins) =>
     const errors: Error[] = []
     const remaining = new Set(requiredCapabilities)
     const proven: Verification[] = []
+    let budgetExceeded: ProofBudgetExceededError | null = null
 
     // Check that all required capabilities are verified
-    loop: for await (const delegationChain of delegationChains(plugins)(semantics, decoded, isRevoked)) {
+    loop: for await (const delegationChain of delegationChains(plugins)(semantics, decoded, isRevoked, proofGraphBudget)) {
       if (delegationChain instanceof Error) {
+        if (isProofBudgetExceededError(delegationChain)) {
+          // A budget failure is a hard failure: the proof graph could not be
+          // fully evaluated, so any success would be unverified.
+          budgetExceeded = delegationChain
+          break loop
+        }
         errors.push(delegationChain)
         continue
       }
@@ -124,6 +146,10 @@ export const verify = (plugins: Plugins) =>
       if (remaining.size === 0) {
         break loop
       }
+    }
+
+    if (budgetExceeded != null) {
+      return err([ budgetExceeded, ...errors ])
     }
 
     return remaining.size > 0 ? err(errors) : ok(proven)

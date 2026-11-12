@@ -11,6 +11,79 @@ import { SUPERUSER, Superuser } from "./capability/super-user.js"
 
 
 /**
+ * A bounded budget for the proof graph that gets traversed while computing
+ * delegation chains.
+ *
+ * Because proofs can be shared between branches (eg. via `prf:*`), the same
+ * sub-proof may otherwise be recursively expanded over and over again, making
+ * signature checking and delegation-chain enumeration grow exponentially with
+ * the size of the proof graph. Both limits are enforced by default and cause
+ * evaluation to fail with a {@link ProofBudgetExceededError} instead of
+ * running unbounded.
+ */
+export interface ProofGraphBudget {
+  /**
+   * The maximum depth of the proof graph, measured as the number of proof
+   * links away from the UCAN that evaluation started from. The outermost UCAN
+   * is at depth `0`.
+   */
+  maxDepth: number
+  /**
+   * The maximum total number of UCANs that get evaluated (revocation-checked,
+   * parsed and signature-verified) across the entire proof graph, including
+   * the outermost UCAN. Shared proofs are counted every time they're expanded.
+   */
+  maxEvaluations: number
+}
+
+/**
+ * The default proof graph budget. It's generous enough for realistic,
+ * well-formed delegation chains while bounding how much work a maliciously
+ * nested proof graph can cause.
+ */
+export const DEFAULT_PROOF_GRAPH_BUDGET: ProofGraphBudget = {
+  maxDepth: 100,
+  maxEvaluations: 1000,
+}
+
+/**
+ * Error returned (never thrown) when proof graph evaluation exceeds its
+ * {@link ProofGraphBudget}. It carries the configured budget alongside the
+ * depth and evaluation count at which the limit was hit, so callers can
+ * distinguish a budget failure from other verification errors.
+ */
+export class ProofBudgetExceededError extends Error {
+  public readonly name = "ProofBudgetExceededError"
+
+  constructor(
+    public readonly limit: "maxDepth" | "maxEvaluations",
+    public readonly budget: ProofGraphBudget,
+    public readonly depth: number,
+    public readonly evaluations: number,
+  ) {
+    super(
+      limit === "maxDepth"
+        ? `Proof graph exceeded the maximum depth of ${budget.maxDepth} (depth ${depth})`
+        : `Proof graph exceeded the maximum number of evaluations of ${budget.maxEvaluations} (${evaluations} evaluated)`
+    )
+  }
+}
+
+export function isProofBudgetExceededError(error: unknown): error is ProofBudgetExceededError {
+  return error instanceof ProofBudgetExceededError
+}
+
+/**
+ * Mutable evaluation state shared across the whole proof graph traversal.
+ */
+interface ProofGraphState {
+  budget: ProofGraphBudget
+  evaluations: number
+  exceeded: boolean
+}
+
+
+/**
  * UCAN capabilities can have arbitrary semantics for delegation.
  * These semantics can be configured via this record of functions.
  * 
@@ -119,13 +192,46 @@ export type OwnershipScope
  * been revoked or can't be loaded, this doesn't keep this function from figuring
  * out different ways of delegating a capability from the attenuations.
  * It also makes it possible to return early if a valid delegation chain has been found.
+ *
+ * Proof graph traversal is bounded by `proofGraphBudget`; when the budget is
+ * exhausted the iterated output contains a {@link ProofBudgetExceededError}
+ * and traversal stops.
  */
 export const delegationChains = (plugins: Plugins) =>
   async function* ( 
     semantics: DelegationSemantics,
     ucan: Ucan,
     isRevoked: (ucan: Ucan) => Promise<boolean> = async () => false,
+    proofGraphBudget: Partial<ProofGraphBudget> = DEFAULT_PROOF_GRAPH_BUDGET,
   ): AsyncIterable<DelegationChain | Error> {
+  const budget: ProofGraphBudget = { ...DEFAULT_PROOF_GRAPH_BUDGET, ...proofGraphBudget }
+  const state: ProofGraphState = { budget, evaluations: 0, exceeded: false }
+
+  yield* delegationChainsAt(plugins, semantics, ucan, isRevoked, state, 0)
+}
+
+async function* delegationChainsAt(
+  plugins: Plugins,
+  semantics: DelegationSemantics,
+  ucan: Ucan,
+  isRevoked: (ucan: Ucan) => Promise<boolean>,
+  state: ProofGraphState,
+  depth: number,
+): AsyncIterable<DelegationChain | Error> {
+  if (state.exceeded) return
+
+  if (depth > state.budget.maxDepth) {
+    state.exceeded = true
+    yield new ProofBudgetExceededError("maxDepth", state.budget, depth, state.evaluations)
+    return
+  }
+
+  state.evaluations += 1
+  if (state.evaluations > state.budget.maxEvaluations) {
+    state.exceeded = true
+    yield new ProofBudgetExceededError("maxEvaluations", state.budget, depth, state.evaluations)
+    return
+  }
 
   if (await isRevoked(ucan)) {
     yield new Error(`UCAN Revoked: ${token.encode(ucan)}`)
@@ -133,7 +239,7 @@ export const delegationChains = (plugins: Plugins) =>
   }
 
   yield* capabilitiesFromParenthood(ucan)
-  yield* capabilitiesFromDelegation(plugins, semantics, ucan, isRevoked)
+  yield* capabilitiesFromDelegation(plugins, semantics, ucan, isRevoked, state, depth)
 }
 
 
@@ -271,30 +377,36 @@ async function* capabilitiesFromDelegation(
   semantics: DelegationSemantics,
   ucan: Ucan,
   isRevoked: (ucan: Ucan) => Promise<boolean>,
+  state: ProofGraphState,
+  depth: number,
 ): AsyncIterable<DelegationChain | Error> {
 
   let proofIndex = 0
 
   for await (const proof of token.validateProofs(plugins)(ucan)) {
+    if (state.exceeded) return
+
     if (proof instanceof Error) {
       yield proof
       continue
     }
 
     for (const capability of ucan.payload.att) {
+      if (state.exceeded) return
+
       try {
         switch (capability.with.scheme.toLowerCase()) {
           case "my": continue // cannot be delegated, only introduced by parenthood.
           case "as": {
-            yield* handleAsDelegation(plugins, semantics, capability, ucan, proof, isRevoked)
+            yield* handleAsDelegation(plugins, semantics, capability, ucan, proof, isRevoked, state, depth)
             break
           }
           case "prf": {
-            yield* handlePrfDelegation(plugins, semantics, capability, ucan, proof, proofIndex, isRevoked)
+            yield* handlePrfDelegation(plugins, semantics, capability, ucan, proof, proofIndex, isRevoked, state, depth)
             break
           }
           default: {
-            yield* handleNormalDelegation(plugins, semantics, capability, ucan, proof, isRevoked)
+            yield* handleNormalDelegation(plugins, semantics, capability, ucan, proof, isRevoked, state, depth)
           }
         }
       } catch (e) {
@@ -322,6 +434,8 @@ async function* handleAsDelegation(
   ucan: Ucan,
   proof: Ucan,
   isRevoked: (ucan: Ucan) => Promise<boolean>,
+  state: ProofGraphState,
+  depth: number,
 ): AsyncIterable<DelegatedOwnership | Error> {
   const split = capability.with.hierPart.split(":")
   const scheme = split[ split.length - 1 ]
@@ -330,7 +444,7 @@ async function* handleAsDelegation(
     ? SUPERUSER
     : { scheme, ability: capability.can }
 
-  for await (const delegationChain of delegationChains(plugins)(semantics, proof, isRevoked)) {
+  for await (const delegationChain of delegationChainsAt(plugins, semantics, proof, isRevoked, state, depth + 1)) {
     if (delegationChain instanceof Error) {
       yield delegationChain
       continue
@@ -363,6 +477,8 @@ async function* handlePrfDelegation(
   proof: Ucan,
   proofIndex: number,
   isRevoked: (ucan: Ucan) => Promise<boolean>,
+  state: ProofGraphState,
+  depth: number,
 ): AsyncIterable<DelegatedCapability | Error> {
   if (
     capability.with.hierPart !== SUPERUSER
@@ -372,7 +488,7 @@ async function* handlePrfDelegation(
     // we only process the delegation if proofIndex === 2
     return
   }
-  for await (const delegationChain of delegationChains(plugins)(semantics, proof, isRevoked)) {
+  for await (const delegationChain of delegationChainsAt(plugins, semantics, proof, isRevoked, state, depth + 1)) {
     if (delegationChain instanceof Error) {
       yield delegationChain
       continue
@@ -396,8 +512,10 @@ async function* handleNormalDelegation(
   ucan: Ucan,
   proof: Ucan,
   isRevoked: (ucan: Ucan) => Promise<boolean>,
+  state: ProofGraphState,
+  depth: number,
 ): AsyncIterable<DelegatedCapability | Error> {
-  for await (const delegationChain of delegationChains(plugins)(semantics, proof, isRevoked)) {
+  for await (const delegationChain of delegationChainsAt(plugins, semantics, proof, isRevoked, state, depth + 1)) {
     if (delegationChain instanceof Error) {
       yield delegationChain
       continue
@@ -422,4 +540,3 @@ function canDelegate(
   return semantics.canDelegateResource(parentCapability.with, childCapability.with)
     && semantics.canDelegateAbility(parentCapability.can, childCapability.can)
 }
-
